@@ -1,11 +1,69 @@
 """
-PSX Auditor Scraper — GitHub Actions Edition (V3 - Escalating Strategies)
-==========================================================================
-FIXED: Handles JavaScript/AJAX-loaded DataTables using 3 escalating strategies.
-Strategy 1: DataTable API hook (injects JS to read table data directly).
-Strategy 2: Selenium explicit wait + XPath on rendered rows.
-Strategy 3: Full-page BeautifulSoup scan (after JS renders everything).
+PSX Auditor Scraper — GitHub Actions Edition (v2)
+=============================================
+Scrapes every listed company on PSX and finds their statutory auditor.
+Saves all results + a filtered sheet for the TARGET_AUDITOR.
+
+WHAT CHANGED IN v2 (link-gathering rewrite)
+--------------------------------------------
+v1 assumed the "Listed Companies" page was a paginated jQuery DataTable that
+could be flipped to "show all" and scraped with plain BeautifulSoup. That's
+not actually how the page works:
+
+  1. The listing page (www.psx.com.pk/.../listed-companies) is a SECTOR /
+     SYMBOL filter widget, not a table with pagination. By default it shows
+     "No Result Found!" — a row only appears after you pick something from
+     the "Select Sector" or "Select Symbol" dropdown, which fires an AJAX
+     call. There's no "Show All" button to find.
+
+  2. HOWEVER — the "Select Symbol" dropdown itself is rendered server-side.
+     It already contains the full list of ~700 PSX ticker symbols in the
+     raw HTML, with zero AJAX/JS required to read it. I confirmed this by
+     fetching the page directly.
+
+  3. The bigger issue: that listing page never had a per-company detail
+     page with an "Auditor" field to begin with — there's no
+     /listed-companies/{SYMBOL} sub-page on www.psx.com.pk at all. The
+     actual structured Auditor field lives on PSX's *Data Portal* at
+     https://dps.psx.com.pk/company/{SYMBOL} — confirmed for OGDC and FFC,
+     both of which render a clean "AUDITOR" label/value pair server-side
+     (no JS needed to see it).
+
+So v2 gets the master symbol list cheaply and reliably (Strategy 1, no
+browser needed), and points every company URL at the Data Portal instead
+of the old broken path. Strategies 2 and 3 exist as escalating fallbacks
+in case PSX changes its markup so Strategy 1 stops working.
+
+  Strategy 1 — STATIC PAGE PARSE (primary)
+      Plain `requests.get()` on the listing page, parse the "Select Symbol"
+      dropdown directly. No Selenium, no waiting — this content was never
+      behind JavaScript.
+
+  Strategy 2 — LIVE SECTOR ITERATION (escalation)
+      Only runs if Strategy 1 returns suspiciously few symbols. Drives the
+      "Select Sector" dropdown one option at a time with Selenium, waits
+      for the AJAX-populated results table to genuinely change (polling,
+      not a blind sleep), and scrapes whatever rows appear for each sector.
+
+  Strategy 3 — NETWORK-LOG DISCOVERY (last resort)
+      Only runs if Strategy 2 also comes up short. Turns on Chrome's
+      performance/network logging, triggers one sector selection, and
+      inspects the captured network traffic for the underlying JSON
+      endpoint the page calls. This is diagnostic rather than guaranteed —
+      I can't execute PSX's JS myself to verify the exact response shape,
+      so it writes everything it finds to network_discovery_debug.json for
+      you to inspect, in addition to a best-effort symbol extraction.
+
+A WORTHWHILE EXPERIMENT: the dps.psx.com.pk/company/{SYMBOL} pages also
+appeared to render their content server-side when I fetched one directly
+(no JS execution on my end). If that holds up, you may not need Selenium
+for the per-company scrape (Section 4) either — it could become a plain
+`requests` loop, which would be faster and far less flaky in CI. Worth
+testing on a handful of symbols before ripping Selenium out, since I
+can't 100% guarantee that from outside a real browser. Section 4 below is
+left on Selenium for now since that's what you've already validated.
 """
+
 import json
 import os
 import re
@@ -14,6 +72,7 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import requests
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -26,27 +85,41 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support.ui import Select, WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ═══════════════════════ CONFIGURATION ═══════════════════════════════
-TARGET_AUDITOR       = "Reanda Haroon Zakaria"
-OUTPUT_ALL           = "psx_companies_auditor_list.xlsx"
-OUTPUT_FILTERED      = "filtered_psx_companies_auditor_list.xlsx"
-CHECKPOINT_FILE      = "scraper_checkpoint.json"
-BASE_URL             = "https://www.psx.com.pk/psx/resources-and-tools/listings/listed-companies"
+TARGET_AUDITOR        = "Reanda Haroon Zakaria"
+OUTPUT_ALL             = "psx_companies_auditor_list.xlsx"
+OUTPUT_FILTERED        = "filtered_psx_companies_auditor_list.xlsx"
+CHECKPOINT_FILE        = "scraper_checkpoint.json"
 
-MAX_RETRIES          = 3
-REQUEST_DELAY        = 2.0
-CHECKPOINT_INTERVAL  = 10
-PAGE_LOAD_TIMEOUT    = 45
+LISTING_URL            = "https://www.psx.com.pk/psx/resources-and-tools/listings/listed-companies"
+COMPANY_URL_TEMPLATE   = "https://dps.psx.com.pk/company/{symbol}"
+
+MIN_EXPECTED_SYMBOLS   = 200     # PSX has 500+ tickers; far fewer than this means a strategy broke
+MAX_RETRIES            = 3       # Retry attempts per company page
+REQUEST_DELAY          = 2.0     # Seconds between requests (be polite)
+CHECKPOINT_INTERVAL    = 10      # Save progress every N companies
+PAGE_LOAD_TIMEOUT      = 45      # Seconds before timing out a page load
+
+UA_HEADER = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+}
 # ═════════════════════════════════════════════════════════════════════
 
 
 # ──────────────────────────────────────────
-# 1. DRIVER SETUP
+# 1.  DRIVER SETUP
 # ──────────────────────────────────────────
 def setup_driver() -> webdriver.Chrome:
+    """
+    Configure Chrome for GitHub Actions headless Ubuntu.
+    Falls back to the system chromedriver if webdriver-manager fails.
+    Performance logging is enabled so Strategy 3 (network sniffing) can
+    inspect real traffic if it's ever needed.
+    """
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -56,18 +129,15 @@ def setup_driver() -> webdriver.Chrome:
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-infobars")
     options.add_argument("--ignore-certificate-errors")
-    options.add_argument(
-        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    )
+    options.add_argument(f"--user-agent={UA_HEADER['User-Agent']}")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
+    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
     try:
         print("  Setting up ChromeDriver via webdriver-manager …")
         service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
+        driver  = webdriver.Chrome(service=service, options=options)
     except Exception as e:
         print(f"  webdriver-manager failed ({e}), trying system ChromeDriver …")
         driver = webdriver.Chrome(options=options)
@@ -77,7 +147,7 @@ def setup_driver() -> webdriver.Chrome:
 
 
 # ──────────────────────────────────────────
-# 2. CHECKPOINT
+# 2.  CHECKPOINT (RESUME SUPPORT)
 # ──────────────────────────────────────────
 def load_checkpoint() -> dict:
     if Path(CHECKPOINT_FILE).exists():
@@ -95,216 +165,240 @@ def save_checkpoint(processed_urls: set, results: list) -> None:
 
 
 # ──────────────────────────────────────────
-# 3. LINK-GATHERING — 3 ESCALATING STRATEGIES
+# 3.  SYMBOL / LINK GATHERING — THREE ESCALATING STRATEGIES
 # ──────────────────────────────────────────
-
-def _strategy_1_direct_datatable_api(driver: webdriver.Chrome) -> set:
-    """
-    STRATEGY 1: Directly hook into the DataTable API via JavaScript.
-    This reads the table data from the DataTable's internal memory (fastest & most reliable).
-    """
-    print("  [Strategy 1] Attempting DataTable API hook via JS...")
-    try:
-        # Wait for DataTable to exist
-        WebDriverWait(driver, 10).until(
-            lambda d: d.execute_script("return typeof $.fn.DataTable !== 'undefined'")
-        )
-        
-        js_code = """
-        let links = [];
-        try {
-            // Find the first DataTable on the page
-            let table = $('table').DataTable();
-            // Get all rows data
-            let data = table.rows().data();
-            for (let i = 0; i < data.length; i++) {
-                let row = data[i];
-                // PSX DataTable usually has the symbol/company name in the first column
-                // We search for any <a> tag within the rendered row.
-                let rowNode = table.row(i).node();
-                let anchor = $(rowNode).find('a').filter(function() {
-                    return $(this).attr('href') && $(this).attr('href').includes('listed-companies');
-                }).first();
-                if (anchor.length > 0) {
-                    let href = anchor.attr('href');
-                    if (href.startsWith('/')) href = 'https://www.psx.com.pk' + href;
-                    links.push(href);
-                }
-            }
-        } catch(e) {
-            return [];
-        }
-        return links;
-        """
-        
-        result = driver.execute_script(js_code)
-        if result and len(result) > 0:
-            print(f"  [Strategy 1] Successfully extracted {len(result)} links via DataTable API.")
-            return set(result)
-        else:
-            print("  [Strategy 1] DataTable API returned 0 links. Escalating...")
-            return set()
-    except Exception as e:
-        print(f"  [Strategy 1] Failed: {str(e)[:80]}. Escalating...")
-        return set()
+SYMBOL_RE = re.compile(r"^[A-Z0-9]{2,12}$")
 
 
-def _strategy_2_selenium_explicit_wait(driver: webdriver.Chrome) -> set:
-    """
-    STRATEGY 2: Wait for the table to render, then use Selenium XPath.
-    This waits for the AJAX to finish populating <tbody> with rows.
-    """
-    print("  [Strategy 2] Waiting for table rows via Selenium explicit wait...")
-    try:
-        # Wait for at least 2 rows to appear in the tbody
-        WebDriverWait(driver, 20).until(
-            EC.presence_of_all_elements_located((By.XPATH, "//table//tbody/tr/td/a[contains(@href, 'listed-companies')]"))
-        )
-        time.sleep(2)  # Extra buffer for lazy-load
-        
-        elements = driver.find_elements(By.XPATH, "//table//tbody/tr/td/a[contains(@href, 'listed-companies')]")
-        
-        links = set()
-        for el in elements:
-            href = el.get_attribute("href")
-            if href:
-                if href.startswith("/"):
-                    href = "https://www.psx.com.pk" + href
-                if "listed-companies" in href:
-                    links.add(href)
-        
-        if links:
-            print(f"  [Strategy 2] Found {len(links)} links via Selenium XPath.")
-            return links
-        else:
-            print("  [Strategy 2] XPath found elements but 0 links extracted. Escalating...")
-            return set()
-    except TimeoutException:
-        print("  [Strategy 2] Timeout waiting for table rows. Escalating...")
-        return set()
-    except Exception as e:
-        print(f"  [Strategy 2] Failed: {str(e)[:80]}. Escalating...")
-        return set()
+def _clean_symbol_candidates(raw_values: list) -> set:
+    out = set()
+    for v in raw_values:
+        v = (v or "").strip()
+        if not v or re.match(r"select\s+symbol", v, re.I) or re.match(r"select\s+sector", v, re.I):
+            continue
+        if SYMBOL_RE.match(v):
+            out.add(v)
+    return out
 
 
-def _strategy_3_full_beautifulsoup_scan(driver: webdriver.Chrome) -> set:
+def _extract_symbols_from_dropdown(soup: BeautifulSoup) -> set:
     """
-    STRATEGY 3: Full-page scan using BeautifulSoup AFTER ensuring JavaScript has run.
-    Also handles pagination by clicking "Next" buttons.
+    Find the <select> whose first option reads 'Select Symbol' and pull
+    every other option as a ticker symbol. Checks the option's displayed
+    text first (that's what PSX uses), falling back to its `value`
+    attribute in case a future markup change separates the two.
     """
-    print("  [Strategy 3] Performing full BeautifulSoup scan with pagination...")
-    
-    all_links = set()
-    
-    # Ensure we are on page 1
-    try:
-        # Try to find and click "Show All" if it exists
-        show_all = driver.find_element(By.XPATH, "//*[contains(text(),'Show All')]")
-        show_all.click()
-        time.sleep(3)
-    except:
-        pass
-    
-    current_page = 1
-    max_pages = 20  # Safety limit to avoid infinite loop
-    
-    while current_page <= max_pages:
-        try:
-            # Wait for body and scroll
-            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-            
-            soup = BeautifulSoup(driver.page_source, "lxml")
-            
-            # Find all links containing 'listed-companies' but skip the listing page itself
-            for a in soup.find_all("a", href=True):
-                href = a["href"].strip()
-                if not href or href.startswith("#") or "javascript" in href:
-                    continue
-                if "listed-companies" in href and "resources-and-tools" in href:
-                    full = f"https://www.psx.com.pk{href}" if href.startswith("/") else href
-                    if full.rstrip("/") not in [BASE_URL, BASE_URL + "/"]:
-                        all_links.add(full)
-            
-            print(f"  [Strategy 3] Page {current_page}: Found {len(all_links)} links so far.")
-            
-            # Try to click the "Next" pagination button
-            try:
-                next_btn = driver.find_element(By.XPATH, "//a[contains(@class,'next') or contains(text(),'Next')]")
-                if "disabled" in (next_btn.get_attribute("class") or ""):
-                    break
-                next_btn.click()
-                time.sleep(3)
-                current_page += 1
-            except NoSuchElementException:
-                break
-            except StaleElementReferenceException:
-                break
-                
-        except Exception as e:
-            print(f"  [Strategy 3] Error on page {current_page}: {str(e)[:80]}")
-            break
-    
-    if all_links:
-        print(f"  [Strategy 3] Total unique links found: {len(all_links)}")
-    else:
-        print("  [Strategy 3] No links found. PSX structure might have changed drastically.")
-    
-    return all_links
+    for select in soup.find_all("select"):
+        options = select.find_all("option")
+        if not options:
+            continue
+        texts = [o.get_text(strip=True) for o in options]
+        if not any(re.match(r"select\s+symbol", t, re.I) for t in texts):
+            continue
+        values = [o.get("value", "") for o in options]
+        symbols = _clean_symbol_candidates(texts)
+        if len(symbols) < MIN_EXPECTED_SYMBOLS:
+            symbols |= _clean_symbol_candidates(values)
+        return symbols
+    return set()
 
 
-def get_all_company_links(driver: webdriver.Chrome) -> list:
-    """
-    Main orchestrator for the 3 escalating strategies.
-    Returns a list of unique company detail page URLs.
-    """
-    print(f"\n  Loading listing page: {BASE_URL}")
-    
-    for attempt in range(MAX_RETRIES):
-        try:
-            # Navigate to the page
-            driver.get(BASE_URL)
-            WebDriverWait(driver, 30).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            time.sleep(4)  # Initial JS warm-up
-            
-            # -----------------------------------------------------------------
-            # STRATEGY 1: Direct DataTable API
-            # -----------------------------------------------------------------
-            links = _strategy_1_direct_datatable_api(driver)
-            if links:
-                return list(links)
-            
-            # -----------------------------------------------------------------
-            # STRATEGY 2: Selenium Explicit Wait + XPath
-            # -----------------------------------------------------------------
-            links = _strategy_2_selenium_explicit_wait(driver)
-            if links:
-                return list(links)
-            
-            # -----------------------------------------------------------------
-            # STRATEGY 3: Full BeautifulSoup Scan with Pagination
-            # -----------------------------------------------------------------
-            links = _strategy_3_full_beautifulsoup_scan(driver)
-            if links:
-                return list(links)
-            
-            # If all strategies fail, retry the whole process
-            print(f"  All strategies failed on attempt {attempt+1}. Retrying...")
-            
-        except Exception as e:
-            wait = 5 * (attempt + 1)
-            print(f"  Attempt {attempt+1} failed: {str(e)[:80]}  — retrying in {wait}s …")
-            time.sleep(wait)
-    
-    print("  FATAL: All 3 strategies failed after max retries.")
+def _extract_sector_names(soup: BeautifulSoup) -> list:
+    """Pull every option from the 'Select Sector' dropdown (used by Strategy 2)."""
+    for select in soup.find_all("select"):
+        options = select.find_all("option")
+        texts = [o.get_text(strip=True) for o in options]
+        if any(re.match(r"select\s+sector", t, re.I) for t in texts):
+            return [t for t in texts if t and not re.match(r"select\s+sector", t, re.I)]
     return []
 
 
+def _extract_symbols_from_result_table(soup: BeautifulSoup) -> set:
+    """After a sector/symbol is selected, PSX injects a results table with
+    a 'Symbols' column — pull tickers out of its first cell per row."""
+    found = set()
+    for table in soup.find_all("table"):
+        header_text = " ".join(th.get_text(strip=True).lower() for th in table.find_all("th"))
+        if "symbol" not in header_text:
+            continue
+        for row in table.find_all("tr"):
+            cells = row.find_all("td")
+            if cells:
+                found |= _clean_symbol_candidates([cells[0].get_text(strip=True)])
+    return found
+
+
+# ---- Strategy 1: plain HTTP, no browser ----
+def get_symbols_via_static_page() -> set:
+    """
+    The 'Select Symbol' dropdown is rendered server-side, so a plain GET
+    request is enough — no Selenium, no AJAX wait, nothing JS-dependent.
+    This is the fix for the root cause: v1 was trying to parse a *results
+    table* that genuinely never renders without JS, when the data it
+    actually needed (the full symbol list) was sitting in static HTML the
+    whole time.
+    """
+    print("  [Strategy 1] Fetching the static symbol dropdown via plain HTTP …")
+    try:
+        resp = requests.get(LISTING_URL, headers=UA_HEADER, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "lxml")
+        symbols = _extract_symbols_from_dropdown(soup)
+        print(f"    → {len(symbols)} symbols found.")
+        return symbols
+    except requests.RequestException as e:
+        print(f"    Strategy 1 failed: {str(e)[:100]}")
+        return set()
+
+
+# ---- Strategy 2: drive the live sector filter with Selenium ----
+def _find_select_element(driver, placeholder_regex: str):
+    for sel in driver.find_elements(By.TAG_NAME, "select"):
+        opts = sel.find_elements(By.TAG_NAME, "option")
+        if opts and re.match(placeholder_regex, opts[0].text.strip(), re.I):
+            return sel
+    return None
+
+
+def get_symbols_via_sector_iteration(driver: webdriver.Chrome) -> set:
+    """
+    Escalation path: select each sector in turn and wait for the AJAX
+    results table to genuinely refresh (polled, not a fixed sleep) before
+    scraping it. This recovers data even if the static dropdown that
+    Strategy 1 relies on ever goes away.
+    """
+    print("  [Strategy 2] Driving the live Sector filter (this is slower) …")
+    try:
+        driver.get(LISTING_URL)
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+    except (TimeoutException, WebDriverException) as e:
+        print(f"    Could not load listing page: {str(e)[:80]}")
+        return set()
+
+    soup = BeautifulSoup(driver.page_source, "lxml")
+    sector_names = _extract_sector_names(soup)
+    if not sector_names:
+        print("    Could not find a 'Select Sector' dropdown — skipping Strategy 2.")
+        return set()
+
+    all_symbols = set()
+    for sector in sector_names:
+        try:
+            before_html = driver.find_element(By.TAG_NAME, "body").text
+            sector_el = _find_select_element(driver, r"select\s+sector")
+            if sector_el is None:
+                continue
+            Select(sector_el).select_by_visible_text(sector)
+
+            WebDriverWait(driver, 15).until(
+                lambda d: d.find_element(By.TAG_NAME, "body").text != before_html
+            )
+            time.sleep(0.8)  # let the final re-render settle
+
+            soup = BeautifulSoup(driver.page_source, "lxml")
+            found = _extract_symbols_from_result_table(soup)
+            all_symbols |= found
+            print(f"    {sector[:45]:<45} +{len(found)}  (total {len(all_symbols)})")
+
+        except (TimeoutException, StaleElementReferenceException, NoSuchElementException) as e:
+            print(f"    {sector[:45]:<45} ⚠ skipped ({str(e)[:50]})")
+            continue
+
+    return all_symbols
+
+
+# ---- Strategy 3: sniff network traffic for the underlying JSON endpoint ----
+def get_symbols_via_network_sniffing(driver: webdriver.Chrome) -> set:
+    """
+    Last resort. Triggers one AJAX call and reads Chrome's own network log
+    to find candidate API endpoints, instead of guessing at front-end
+    markup. I can't execute PSX's JS from where I'm sitting to confirm the
+    exact response shape, so treat this as diagnostic: every candidate URL
+    and a best-effort symbol scrape get written to
+    network_discovery_debug.json for you to check by hand.
+    """
+    print("  [Strategy 3] Sniffing network traffic for the data endpoint …")
+    found_symbols = set()
+    candidate_urls = set()
+
+    try:
+        driver.get(LISTING_URL)
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+
+        sector_el = _find_select_element(driver, r"select\s+sector")
+        if sector_el is not None:
+            options = [o.text.strip() for o in Select(sector_el).options if o.text.strip()]
+            target = next((o for o in options if not re.match(r"select\s+sector", o, re.I)), None)
+            if target:
+                Select(sector_el).select_by_visible_text(target)
+                time.sleep(4)
+
+        for entry in driver.get_log("performance"):
+            try:
+                msg = json.loads(entry["message"])["message"]
+                if msg.get("method") == "Network.responseReceived":
+                    resp = msg["params"]["response"]
+                    url, mime = resp.get("url", ""), resp.get("mimeType", "")
+                    if "json" in mime or any(k in url.lower() for k in ("ajax", "api", "company", "symbol")):
+                        candidate_urls.add(url)
+            except (KeyError, json.JSONDecodeError):
+                continue
+
+        cookies = {c["name"]: c["value"] for c in driver.get_cookies()}
+        debug_entries = []
+        for url in candidate_urls:
+            try:
+                resp = requests.get(url, cookies=cookies, headers=UA_HEADER, timeout=10)
+                snippet = resp.text[:500]
+                debug_entries.append({"url": url, "status": resp.status_code, "snippet": snippet})
+                found_symbols |= _clean_symbol_candidates(re.findall(r'"([A-Z0-9]{2,12})"', resp.text))
+            except requests.RequestException as e:
+                debug_entries.append({"url": url, "error": str(e)[:100]})
+
+        with open("network_discovery_debug.json", "w", encoding="utf-8") as f:
+            json.dump({"candidate_endpoints": debug_entries}, f, indent=2, ensure_ascii=False)
+        print(f"    Logged {len(candidate_urls)} candidate endpoint(s) → network_discovery_debug.json")
+        print(f"    Best-effort symbol extraction: {len(found_symbols)} found.")
+
+    except WebDriverException as e:
+        print(f"    Network sniffing failed: {str(e)[:100]}")
+
+    return found_symbols
+
+
+# ---- Orchestrator: escalate only as far as needed ----
+def get_all_company_links(driver: webdriver.Chrome) -> list:
+    print(f"\n  Discovering PSX ticker symbols from: {LISTING_URL}")
+
+    symbols = get_symbols_via_static_page()
+
+    if len(symbols) < MIN_EXPECTED_SYMBOLS:
+        print(f"  Only {len(symbols)} symbols so far (expected {MIN_EXPECTED_SYMBOLS}+) — escalating to Strategy 2.")
+        symbols |= get_symbols_via_sector_iteration(driver)
+
+    if len(symbols) < MIN_EXPECTED_SYMBOLS:
+        print(f"  Still only {len(symbols)} symbols — escalating to Strategy 3.")
+        symbols |= get_symbols_via_network_sniffing(driver)
+
+    if not symbols:
+        print("  ERROR: All three strategies failed to find any symbols.")
+        return []
+
+    links = [COMPANY_URL_TEMPLATE.format(symbol=s) for s in sorted(symbols)]
+    print(f"  Final symbol count: {len(symbols)} → {len(links)} company URLs built "
+          f"(template: {COMPANY_URL_TEMPLATE}).")
+    return links
+
+
 # ──────────────────────────────────────────
-# 4. COMPANY PAGE — EXTRACT AUDITOR
+# 4.  COMPANY PAGE — EXTRACT AUDITOR
+#     (unchanged from v1 — these 5 fallback strategies already handle a
+#      plain label/value layout like dps.psx.com.pk's "AUDITOR" field;
+#      only the URLs feeding into this section changed.)
 # ──────────────────────────────────────────
 def _strategy_table_rows(soup: BeautifulSoup) -> str | None:
     for row in soup.find_all("tr"):
@@ -333,7 +427,7 @@ def _strategy_inline_colon(soup: BeautifulSoup) -> str | None:
     for el in soup.find_all(["p", "div", "span", "li"]):
         if len(el.find_all()) > 8:
             continue
-        text = el.get_text(strip=True)
+        text  = el.get_text(strip=True)
         match = re.match(
             r"(?:Statutory\s+)?(?:External\s+)?Auditors?\s*:\s*(.+)",
             text, re.I
@@ -372,7 +466,7 @@ def _strategy_script_json(soup: BeautifulSoup) -> str | None:
             return m.group(1)
         for candidate in re.findall(r"\{[^{}]{20,}\}", content):
             try:
-                obj = json.loads(candidate)
+                obj   = json.loads(candidate)
                 found = _dig(obj)
                 if found:
                     return found
@@ -383,7 +477,7 @@ def _strategy_script_json(soup: BeautifulSoup) -> str | None:
 
 def _strategy_full_text_regex(soup: BeautifulSoup) -> str | None:
     page_text = soup.get_text(separator="\n")
-    patterns = [
+    patterns  = [
         r"(?:Statutory\s+)?Auditors?\s*:\s*([^\n]{3,200})",
         r"(?:External\s+)?Auditors?\s*:\s*([^\n]{3,200})",
         r"Auditors?\s*\n\s*([^\n]{3,200})",
@@ -421,6 +515,7 @@ def scrape_company(driver: webdriver.Chrome, url: str) -> str:
             time.sleep(1.5)
             soup = BeautifulSoup(driver.page_source, "lxml")
             return extract_auditor(soup)
+
         except TimeoutException:
             print(f"\n    [Timeout — attempt {attempt+1}/{MAX_RETRIES}]", end="")
             time.sleep(4 * (attempt + 1))
@@ -430,39 +525,41 @@ def scrape_company(driver: webdriver.Chrome, url: str) -> str:
         except Exception as exc:
             print(f"\n    [Unexpected error: {str(exc)[:60]}]", end="")
             break
+
     return "Error: scrape failed"
 
 
 # ──────────────────────────────────────────
-# 5. MAIN
+# 5.  MAIN
 # ──────────────────────────────────────────
 def main():
     print("=" * 64)
-    print("  PSX Auditor Scraper — V3 (Escalating Strategies)")
+    print("  PSX Auditor Scraper — GitHub Actions Edition (v2)")
     print(f"  Target auditor : {TARGET_AUDITOR}")
-    print(f"  Listing URL    : {BASE_URL}")
+    print(f"  Symbol source  : {LISTING_URL}")
+    print(f"  Company URL    : {COMPANY_URL_TEMPLATE}")
     print("=" * 64)
 
-    checkpoint = load_checkpoint()
+    checkpoint     = load_checkpoint()
     processed_urls = set(checkpoint["processed_urls"])
-    results = list(checkpoint["results"])
+    results        = list(checkpoint["results"])
 
     driver = setup_driver()
 
     try:
         all_links = get_all_company_links(driver)
         if not all_links:
-            print("\nFATAL: No company links found after all strategies. Exiting.")
+            print("\nFATAL: No company links found. Exiting.")
             sys.exit(1)
 
-        remaining = [u for u in all_links if u not in processed_urls]
+        remaining  = [u for u in all_links if u not in processed_urls]
         done_count = len(processed_urls)
-        total = len(all_links)
+        total      = len(all_links)
 
         print(f"\n  Total: {total}  |  Already done: {done_count}  |  Remaining: {len(remaining)}\n")
 
         for idx, url in enumerate(remaining, start=1):
-            symbol = url.rstrip("/").split("/")[-1]
+            symbol  = url.rstrip("/").split("/")[-1]
             display = f"[{done_count + idx}/{total}]  {symbol:<14}"
             print(display, end="→ ", flush=True)
 
@@ -471,9 +568,9 @@ def main():
             print(truncated)
 
             results.append({
-                "Company Code": symbol,
-                "URL": url,
-                "Auditor": auditor,
+                "Company Code"     : symbol,
+                "URL"              : url,
+                "Auditor"          : auditor,
                 "Is Target Auditor": TARGET_AUDITOR.lower() in auditor.lower(),
             })
             processed_urls.add(url)
@@ -489,7 +586,7 @@ def main():
         df.to_excel(OUTPUT_ALL, index=False)
         print(f"\n✅  Full data saved → {OUTPUT_ALL}  ({len(df)} companies)")
 
-        mask = df["Auditor"].str.contains(TARGET_AUDITOR, case=False, na=False)
+        mask      = df["Auditor"].str.contains(TARGET_AUDITOR, case=False, na=False)
         target_df = df[mask].copy()
 
         print(f"\n{'='*64}")
@@ -508,11 +605,11 @@ def main():
             print(f"     Error count       : {df['Auditor'].str.startswith('Error').sum()}")
 
             pd.DataFrame({
-                "Status": ["No match"],
-                "Target Auditor Searched": [TARGET_AUDITOR],
-                "Total Companies Scraped": [len(df)],
-                "Auditor Found Count": [(df["Auditor"] != "Not Found").sum()],
-                "Not Found Count": [(df["Auditor"] == "Not Found").sum()],
+                "Status"                  : ["No match"],
+                "Target Auditor Searched" : [TARGET_AUDITOR],
+                "Total Companies Scraped" : [len(df)],
+                "Auditor Found Count"     : [(df["Auditor"] != "Not Found").sum()],
+                "Not Found Count"         : [(df["Auditor"] == "Not Found").sum()],
             }).to_excel(OUTPUT_FILTERED, index=False)
 
         print(f"\n{'─'*64}")
