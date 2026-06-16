@@ -1,0 +1,10 @@
+# PSX Auditor Scraper — Python dependencies
+# Pinned for reproducibility in GitHub Actions
+
+selenium>=4.18.0
+webdriver-manager>=4.0.1
+beautifulsoup4>=4.12.0
+lxml>=5.1.0          # Faster HTML parser for BeautifulSoup (replaces html.parser)
+pandas>=2.0.0
+openpyxl>=3.1.0      # Required for pandas .to_excel()
+requests>=2.31.0     # Useful for lightweight HTTP checks / fallback fetches
