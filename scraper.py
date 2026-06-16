@@ -1,21 +1,8 @@
 """
-PSX Auditor Scraper — GitHub Actions Edition
-=============================================
-Scrapes every listed company on PSX and finds their statutory auditor.
-Saves all results + a filtered sheet for the TARGET_AUDITOR.
-
-Key improvements over v1:
-  - Fixed Selenium 4 By.TAG_NAME usage (original had "tag name" string bug)
-  - Checkpoint / resume — picks up exactly where it left off after a crash
-  - Retry logic with back-off on every company fetch
-  - 5 extraction strategies for the auditor field
-  - Pagination support on the main listing page
-  - Incremental Excel saves every 10 companies
-  - Proper DataTable "show all" triggering via JS
-  - JSON-LD / embedded JSON scanning
-  - Human-like delays + user-agent to avoid rate-limiting
+PSX Auditor Scraper — GitHub Actions Edition (PATCHED)
+========================================================
+FIXED: "Found 0 company links" error by adding Selenium direct XPath wait.
 """
-
 import json
 import os
 import re
@@ -34,7 +21,7 @@ from selenium.common.exceptions import (
 )
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By          # ← FIX: was missing in original
+from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 from webdriver_manager.chrome import ChromeDriverManager
@@ -46,31 +33,26 @@ OUTPUT_FILTERED      = "filtered_psx_companies_auditor_list.xlsx"
 CHECKPOINT_FILE      = "scraper_checkpoint.json"
 BASE_URL             = "https://www.psx.com.pk/psx/resources-and-tools/listings/listed-companies"
 
-MAX_RETRIES          = 3        # Retry attempts per company page
-REQUEST_DELAY        = 2.0      # Seconds between requests (be polite)
-CHECKPOINT_INTERVAL  = 10       # Save progress every N companies
-PAGE_LOAD_TIMEOUT    = 45       # Seconds before timing out a page load
+MAX_RETRIES          = 3
+REQUEST_DELAY        = 2.0
+CHECKPOINT_INTERVAL  = 10
+PAGE_LOAD_TIMEOUT    = 45
 # ═════════════════════════════════════════════════════════════════════
 
 
 # ──────────────────────────────────────────
-# 1.  DRIVER SETUP
+# 1. DRIVER SETUP
 # ──────────────────────────────────────────
 def setup_driver() -> webdriver.Chrome:
-    """
-    Configure Chrome for GitHub Actions headless Ubuntu.
-    Falls back to the system chromedriver if webdriver-manager fails.
-    """
     options = Options()
-    options.add_argument("--headless=new")           # New headless (Chrome 112+)
-    options.add_argument("--no-sandbox")             # Required in CI
-    options.add_argument("--disable-dev-shm-usage")  # Prevents /dev/shm OOM
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-infobars")
     options.add_argument("--ignore-certificate-errors")
-    # Spoof a real browser so the site doesn't block headless bots
     options.add_argument(
         "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -82,7 +64,7 @@ def setup_driver() -> webdriver.Chrome:
     try:
         print("  Setting up ChromeDriver via webdriver-manager …")
         service = Service(ChromeDriverManager().install())
-        driver  = webdriver.Chrome(service=service, options=options)
+        driver = webdriver.Chrome(service=service, options=options)
     except Exception as e:
         print(f"  webdriver-manager failed ({e}), trying system ChromeDriver …")
         driver = webdriver.Chrome(options=options)
@@ -92,7 +74,7 @@ def setup_driver() -> webdriver.Chrome:
 
 
 # ──────────────────────────────────────────
-# 2.  CHECKPOINT (RESUME SUPPORT)
+# 2. CHECKPOINT
 # ──────────────────────────────────────────
 def load_checkpoint() -> dict:
     if Path(CHECKPOINT_FILE).exists():
@@ -110,12 +92,11 @@ def save_checkpoint(processed_urls: set, results: list) -> None:
 
 
 # ──────────────────────────────────────────
-# 3.  LISTING PAGE — GET ALL COMPANY LINKS
+# 3. LISTING PAGE — GET ALL COMPANY LINKS (PATCHED)
 # ──────────────────────────────────────────
 def _scroll_fully(driver: webdriver.Chrome, pause: float = 1.2) -> None:
-    """Scroll to the bottom to trigger any lazy-loaded content."""
     last_h = driver.execute_script("return document.body.scrollHeight")
-    for _ in range(10):                         # Max 10 scroll passes
+    for _ in range(10):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(pause)
         new_h = driver.execute_script("return document.body.scrollHeight")
@@ -125,21 +106,15 @@ def _scroll_fully(driver: webdriver.Chrome, pause: float = 1.2) -> None:
 
 
 def _try_show_all(driver: webdriver.Chrome) -> None:
-    """
-    PSX uses jQuery DataTables for the company list.
-    Attempt to set page-length to -1 (show all rows) via JS,
-    then look for "Show All" buttons as a fallback.
-    """
+    """Force DataTable to show all rows."""
     try:
         driver.execute_script("""
             try {
-                // DataTables API
                 var tables = $.fn.dataTable.tables(true);
                 tables.forEach(function(t) {
                     $(t).DataTable().page.len(-1).draw();
                 });
             } catch(e) {}
-            // Also change any <select> that controls page size
             document.querySelectorAll('select').forEach(function(s) {
                 if (['-1','All','100','500'].some(v => {
                     for (var o of s.options) if (o.value === v) return true;
@@ -154,11 +129,11 @@ def _try_show_all(driver: webdriver.Chrome) -> None:
     except Exception:
         pass
 
-    # Button fallback
     for xpath in [
         "//button[normalize-space()='Show All']",
         "//a[normalize-space()='Show All']",
         "//*[contains(@class,'show-all')]",
+        "//*[contains(text(),'Show All')]",
     ]:
         try:
             btn = WebDriverWait(driver, 3).until(
@@ -170,39 +145,16 @@ def _try_show_all(driver: webdriver.Chrome) -> None:
             pass
 
 
-def _extract_links_from_soup(soup: BeautifulSoup) -> set:
-    """Pull every /listed-companies/{SYMBOL} href from the page."""
-    links = set()
-    path_patterns = [
-        "/psx/resources-and-tools/listings/listed-companies/",
-        "/listed-companies/",
-    ]
-    skip_suffixes = ("listed-companies", "listed-companies/")
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href or href.startswith("#") or "javascript" in href:
-            continue
-        if any(p in href for p in path_patterns):
-            # Skip the base listing URL itself
-            if href.rstrip("/").endswith(skip_suffixes):
-                continue
-            full = f"https://www.psx.com.pk{href}" if href.startswith("/") else href
-            links.add(full)
-    return links
-
-
 def get_all_company_links(driver: webdriver.Chrome) -> list:
     """
-    Return every company detail-page URL from the PSX listing.
-    Handles DataTable "show all" and paginated navigation.
+    PATCHED: Uses Selenium's direct find_elements to extract links
+    instead of relying only on BeautifulSoup.
     """
     print(f"\n  Loading listing page: {BASE_URL}")
 
     for attempt in range(MAX_RETRIES):
         try:
             driver.get(BASE_URL)
-            # Wait for the page to fully render
             WebDriverWait(driver, 30).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
@@ -210,52 +162,89 @@ def get_all_company_links(driver: webdriver.Chrome) -> list:
 
             _scroll_fully(driver)
             _try_show_all(driver)
-            _scroll_fully(driver)          # Scroll again after expanding
+            _scroll_fully(driver)
 
-            soup  = BeautifulSoup(driver.page_source, "lxml")
-            links = _extract_links_from_soup(soup)
+            # ---------- PATCH: WAIT FOR TABLE ROWS ----------
+            try:
+                WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr"))
+                )
+                print("  Table rows detected.")
+            except TimeoutException:
+                print("  Warning: Table rows not detected, but continuing...")
 
-            if not links:
-                print("  No links found on first pass — trying row-by-row scan …")
-                for row in soup.find_all("tr"):
-                    for a in row.find_all("a", href=True):
-                        href = a["href"].strip()
-                        if href and "psx.com.pk" in href:
-                            links.add(href)
+            # ---------- METHOD 1: SELENIUM DIRECT XPATH ----------
+            print("  Extracting links using Selenium XPath...")
+            link_elements = driver.find_elements(
+                By.XPATH,
+                "//a[contains(@href, '/listed-companies/') or contains(@href, '/psx/resources-and-tools/listings/listed-companies/')]"
+            )
+            
+            selenium_links = set()
+            for el in link_elements:
+                href = el.get_attribute("href")
+                if href and "listed-companies" in href:
+                    # Clean up the URL
+                    if href.startswith("/"):
+                        href = "https://www.psx.com.pk" + href
+                    # Skip the listing page itself
+                    if href.rstrip("/") not in [BASE_URL, BASE_URL + "/"]:
+                        selenium_links.add(href)
 
-            # ── Pagination: follow "Next" buttons ──
-            all_links  = set(links)
-            page_count = 1
+            if selenium_links:
+                print(f"  Selenium found {len(selenium_links)} company links.")
+                return list(selenium_links)
 
-            while True:
+            # ---------- METHOD 2: BEAUTIFULSOUP FALLBACK ----------
+            print("  Selenium found 0 links. Falling back to BeautifulSoup...")
+            soup = BeautifulSoup(driver.page_source, "lxml")
+            
+            links = set()
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                if not href or href.startswith("#") or "javascript" in href:
+                    continue
+                if "listed-companies" in href:
+                    full = f"https://www.psx.com.pk{href}" if href.startswith("/") else href
+                    if full.rstrip("/") not in [BASE_URL, BASE_URL + "/"]:
+                        links.add(full)
+
+            if links:
+                print(f"  BeautifulSoup found {len(links)} company links.")
+                return list(links)
+
+            # ---------- METHOD 3: ROW-BY-ROW SCAN ----------
+            print("  No links found. Trying row-by-row scan...")
+            for row in soup.find_all("tr"):
+                for a in row.find_all("a", href=True):
+                    href = a["href"].strip()
+                    if "listed-companies" in href:
+                        full = f"https://www.psx.com.pk{href}" if href.startswith("/") else href
+                        if full.rstrip("/") not in [BASE_URL, BASE_URL + "/"]:
+                            links.add(full)
+
+            if links:
+                print(f"  Row-by-row found {len(links)} company links.")
+                return list(links)
+
+            # ---------- PAGINATION FALLBACK ----------
+            print("  Checking for pagination links...")
+            for page_link in driver.find_elements(By.XPATH, "//a[contains(@href, 'page=')]"):
                 try:
-                    next_btn = WebDriverWait(driver, 4).until(
-                        EC.element_to_be_clickable((By.XPATH,
-                            "//a[contains(@class,'next') "
-                            "or normalize-space()='Next' "
-                            "or @aria-label='Next page']"
-                        ))
-                    )
-                    # Stop if the button is disabled
-                    cls = next_btn.get_attribute("class") or ""
-                    if "disabled" in cls:
-                        break
-                    next_btn.click()
+                    page_link.click()
                     time.sleep(3)
-                    page_soup  = BeautifulSoup(driver.page_source, "lxml")
-                    page_links = _extract_links_from_soup(page_soup)
-                    new = page_links - all_links
-                    if not new:
-                        break
-                    all_links.update(new)
-                    page_count += 1
-                    print(f"  Page {page_count}: +{len(new)} links  (total {len(all_links)})")
-                except (TimeoutException, NoSuchElementException, StaleElementReferenceException):
-                    break
+                    soup = BeautifulSoup(driver.page_source, "lxml")
+                    new_links = {a["href"] for a in soup.find_all("a", href=True) if "listed-companies" in a["href"]}
+                    links.update(new_links)
+                except Exception:
+                    continue
 
-            result = list(all_links)
-            print(f"  Found {len(result)} company links total.")
-            return result
+            if links:
+                print(f"  Pagination found {len(links)} company links.")
+                return list(links)
+
+            print("  No links found in any method.")
+            return []
 
         except Exception as e:
             wait = 5 * (attempt + 1)
@@ -267,10 +256,9 @@ def get_all_company_links(driver: webdriver.Chrome) -> list:
 
 
 # ──────────────────────────────────────────
-# 4.  COMPANY PAGE — EXTRACT AUDITOR
+# 4. COMPANY PAGE — EXTRACT AUDITOR
 # ──────────────────────────────────────────
 def _strategy_table_rows(soup: BeautifulSoup) -> str | None:
-    """Look for <tr> with a cell labelled 'auditor' followed by the value cell."""
     for row in soup.find_all("tr"):
         cells = row.find_all(["td", "th"])
         for i, cell in enumerate(cells[:-1]):
@@ -282,7 +270,6 @@ def _strategy_table_rows(soup: BeautifulSoup) -> str | None:
 
 
 def _strategy_definition_lists(soup: BeautifulSoup) -> str | None:
-    """<dt>Auditor</dt><dd>Value</dd>  or  <label>Auditor</label> patterns."""
     for tag in ["dt", "th", "strong", "b", "label"]:
         for el in soup.find_all(tag):
             if re.search(r"\bauditor", el.get_text(strip=True), re.I):
@@ -295,11 +282,10 @@ def _strategy_definition_lists(soup: BeautifulSoup) -> str | None:
 
 
 def _strategy_inline_colon(soup: BeautifulSoup) -> str | None:
-    """Elements whose text matches 'Auditor(s): Value'."""
     for el in soup.find_all(["p", "div", "span", "li"]):
-        if len(el.find_all()) > 8:          # Skip large containers
+        if len(el.find_all()) > 8:
             continue
-        text  = el.get_text(strip=True)
+        text = el.get_text(strip=True)
         match = re.match(
             r"(?:Statutory\s+)?(?:External\s+)?Auditors?\s*:\s*(.+)",
             text, re.I
@@ -312,7 +298,6 @@ def _strategy_inline_colon(soup: BeautifulSoup) -> str | None:
 
 
 def _strategy_script_json(soup: BeautifulSoup) -> str | None:
-    """Scan <script> tags for JSON containing an 'auditor' key."""
     def _dig(obj, depth=0):
         if depth > 6:
             return None
@@ -334,14 +319,12 @@ def _strategy_script_json(soup: BeautifulSoup) -> str | None:
         content = script.string or ""
         if "auditor" not in content.lower():
             continue
-        # Try extracting simple "key": "value" pairs first (fast)
         m = re.search(r'"[Aa]uditor[^"]*"\s*:\s*"([^"]{3,200})"', content)
         if m:
             return m.group(1)
-        # Try full JSON parse
         for candidate in re.findall(r"\{[^{}]{20,}\}", content):
             try:
-                obj   = json.loads(candidate)
+                obj = json.loads(candidate)
                 found = _dig(obj)
                 if found:
                     return found
@@ -351,9 +334,8 @@ def _strategy_script_json(soup: BeautifulSoup) -> str | None:
 
 
 def _strategy_full_text_regex(soup: BeautifulSoup) -> str | None:
-    """Last resort: regex the entire visible text."""
     page_text = soup.get_text(separator="\n")
-    patterns  = [
+    patterns = [
         r"(?:Statutory\s+)?Auditors?\s*:\s*([^\n]{3,200})",
         r"(?:External\s+)?Auditors?\s*:\s*([^\n]{3,200})",
         r"Auditors?\s*\n\s*([^\n]{3,200})",
@@ -362,17 +344,12 @@ def _strategy_full_text_regex(soup: BeautifulSoup) -> str | None:
         m = re.search(pat, page_text, re.I)
         if m:
             result = re.sub(r"\s+", " ", m.group(1)).strip()
-            # Sanity check: must contain real alphabetic content
             if re.search(r"[a-zA-Z]{3}", result) and len(result) < 200:
                 return result
     return None
 
 
 def extract_auditor(soup: BeautifulSoup) -> str:
-    """
-    Try 5 strategies in order of reliability.
-    Returns auditor name or 'Not Found'.
-    """
     for strategy in [
         _strategy_table_rows,
         _strategy_definition_lists,
@@ -387,18 +364,15 @@ def extract_auditor(soup: BeautifulSoup) -> str:
 
 
 def scrape_company(driver: webdriver.Chrome, url: str) -> str:
-    """Navigate to a company page and return its auditor string (with retries)."""
     for attempt in range(MAX_RETRIES):
         try:
             driver.get(url)
-            # ── FIX: correct Selenium 4 By usage ──────────────────
             WebDriverWait(driver, 20).until(
                 EC.presence_of_element_located((By.TAG_NAME, "body"))
             )
             time.sleep(1.5)
             soup = BeautifulSoup(driver.page_source, "lxml")
             return extract_auditor(soup)
-
         except TimeoutException:
             print(f"\n    [Timeout — attempt {attempt+1}/{MAX_RETRIES}]", end="")
             time.sleep(4 * (attempt + 1))
@@ -408,43 +382,39 @@ def scrape_company(driver: webdriver.Chrome, url: str) -> str:
         except Exception as exc:
             print(f"\n    [Unexpected error: {str(exc)[:60]}]", end="")
             break
-
     return "Error: scrape failed"
 
 
 # ──────────────────────────────────────────
-# 5.  MAIN
+# 5. MAIN
 # ──────────────────────────────────────────
 def main():
     print("=" * 64)
-    print("  PSX Auditor Scraper — GitHub Actions Edition")
+    print("  PSX Auditor Scraper — GitHub Actions Edition (PATCHED)")
     print(f"  Target auditor : {TARGET_AUDITOR}")
     print(f"  Listing URL    : {BASE_URL}")
     print("=" * 64)
 
-    # ── Load checkpoint (resume support) ──
-    checkpoint     = load_checkpoint()
+    checkpoint = load_checkpoint()
     processed_urls = set(checkpoint["processed_urls"])
-    results        = list(checkpoint["results"])
+    results = list(checkpoint["results"])
 
     driver = setup_driver()
 
     try:
-        # ── Step 1: Collect all company URLs ──────────────────────
         all_links = get_all_company_links(driver)
         if not all_links:
             print("\nFATAL: No company links found. Exiting.")
             sys.exit(1)
 
-        remaining  = [u for u in all_links if u not in processed_urls]
+        remaining = [u for u in all_links if u not in processed_urls]
         done_count = len(processed_urls)
-        total      = len(all_links)
+        total = len(all_links)
 
         print(f"\n  Total: {total}  |  Already done: {done_count}  |  Remaining: {len(remaining)}\n")
 
-        # ── Step 2: Scrape each company page ──────────────────────
         for idx, url in enumerate(remaining, start=1):
-            symbol  = url.rstrip("/").split("/")[-1]
+            symbol = url.rstrip("/").split("/")[-1]
             display = f"[{done_count + idx}/{total}]  {symbol:<14}"
             print(display, end="→ ", flush=True)
 
@@ -453,14 +423,13 @@ def main():
             print(truncated)
 
             results.append({
-                "Company Code"    : symbol,
-                "URL"             : url,
-                "Auditor"         : auditor,
+                "Company Code": symbol,
+                "URL": url,
+                "Auditor": auditor,
                 "Is Target Auditor": TARGET_AUDITOR.lower() in auditor.lower(),
             })
             processed_urls.add(url)
 
-            # ── Periodic checkpoint + intermediate save ────────────
             if idx % CHECKPOINT_INTERVAL == 0:
                 save_checkpoint(processed_urls, results)
                 pd.DataFrame(results).to_excel(OUTPUT_ALL, index=False)
@@ -468,13 +437,11 @@ def main():
 
             time.sleep(REQUEST_DELAY)
 
-        # ── Step 3: Final save ────────────────────────────────────
         df = pd.DataFrame(results)
         df.to_excel(OUTPUT_ALL, index=False)
         print(f"\n✅  Full data saved → {OUTPUT_ALL}  ({len(df)} companies)")
 
-        # ── Step 4: Filtered output ───────────────────────────────
-        mask      = df["Auditor"].str.contains(TARGET_AUDITOR, case=False, na=False)
+        mask = df["Auditor"].str.contains(TARGET_AUDITOR, case=False, na=False)
         target_df = df[mask].copy()
 
         print(f"\n{'='*64}")
@@ -492,16 +459,14 @@ def main():
             print(f"\n     'Not Found' count : {(df['Auditor'] == 'Not Found').sum()}")
             print(f"     Error count       : {df['Auditor'].str.startswith('Error').sum()}")
 
-            # Write a diagnostic file so the GitHub artifact isn't empty
             pd.DataFrame({
-                "Status"                  : ["No match"],
-                "Target Auditor Searched" : [TARGET_AUDITOR],
-                "Total Companies Scraped" : [len(df)],
-                "Auditor Found Count"     : [(df["Auditor"] != "Not Found").sum()],
-                "Not Found Count"         : [(df["Auditor"] == "Not Found").sum()],
+                "Status": ["No match"],
+                "Target Auditor Searched": [TARGET_AUDITOR],
+                "Total Companies Scraped": [len(df)],
+                "Auditor Found Count": [(df["Auditor"] != "Not Found").sum()],
+                "Not Found Count": [(df["Auditor"] == "Not Found").sum()],
             }).to_excel(OUTPUT_FILTERED, index=False)
 
-        # ── Step 5: Summary ───────────────────────────────────────
         print(f"\n{'─'*64}")
         print(f"  Total scraped     : {len(df)}")
         print(f"  Auditor found     : {(df['Auditor'] != 'Not Found').sum()}")
@@ -510,7 +475,6 @@ def main():
         print(f"  Target matches    : {mask.sum()}")
         print(f"{'─'*64}\n")
 
-        # Remove checkpoint on clean completion
         if Path(CHECKPOINT_FILE).exists():
             os.remove(CHECKPOINT_FILE)
 
