@@ -1,7 +1,10 @@
 """
-PSX Auditor Scraper — GitHub Actions Edition (PATCHED)
-========================================================
-FIXED: "Found 0 company links" error by adding Selenium direct XPath wait.
+PSX Auditor Scraper — GitHub Actions Edition (V3 - Escalating Strategies)
+==========================================================================
+FIXED: Handles JavaScript/AJAX-loaded DataTables using 3 escalating strategies.
+Strategy 1: DataTable API hook (injects JS to read table data directly).
+Strategy 2: Selenium explicit wait + XPath on rendered rows.
+Strategy 3: Full-page BeautifulSoup scan (after JS renders everything).
 """
 import json
 import os
@@ -92,166 +95,211 @@ def save_checkpoint(processed_urls: set, results: list) -> None:
 
 
 # ──────────────────────────────────────────
-# 3. LISTING PAGE — GET ALL COMPANY LINKS (PATCHED)
+# 3. LINK-GATHERING — 3 ESCALATING STRATEGIES
 # ──────────────────────────────────────────
-def _scroll_fully(driver: webdriver.Chrome, pause: float = 1.2) -> None:
-    last_h = driver.execute_script("return document.body.scrollHeight")
-    for _ in range(10):
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(pause)
-        new_h = driver.execute_script("return document.body.scrollHeight")
-        if new_h == last_h:
-            break
-        last_h = new_h
 
-
-def _try_show_all(driver: webdriver.Chrome) -> None:
-    """Force DataTable to show all rows."""
+def _strategy_1_direct_datatable_api(driver: webdriver.Chrome) -> set:
+    """
+    STRATEGY 1: Directly hook into the DataTable API via JavaScript.
+    This reads the table data from the DataTable's internal memory (fastest & most reliable).
+    """
+    print("  [Strategy 1] Attempting DataTable API hook via JS...")
     try:
-        driver.execute_script("""
-            try {
-                var tables = $.fn.dataTable.tables(true);
-                tables.forEach(function(t) {
-                    $(t).DataTable().page.len(-1).draw();
-                });
-            } catch(e) {}
-            document.querySelectorAll('select').forEach(function(s) {
-                if (['-1','All','100','500'].some(v => {
-                    for (var o of s.options) if (o.value === v) return true;
-                    return false;
-                })) {
-                    s.value = '-1';
-                    s.dispatchEvent(new Event('change', {bubbles: true}));
+        # Wait for DataTable to exist
+        WebDriverWait(driver, 10).until(
+            lambda d: d.execute_script("return typeof $.fn.DataTable !== 'undefined'")
+        )
+        
+        js_code = """
+        let links = [];
+        try {
+            // Find the first DataTable on the page
+            let table = $('table').DataTable();
+            // Get all rows data
+            let data = table.rows().data();
+            for (let i = 0; i < data.length; i++) {
+                let row = data[i];
+                // PSX DataTable usually has the symbol/company name in the first column
+                // We search for any <a> tag within the rendered row.
+                let rowNode = table.row(i).node();
+                let anchor = $(rowNode).find('a').filter(function() {
+                    return $(this).attr('href') && $(this).attr('href').includes('listed-companies');
+                }).first();
+                if (anchor.length > 0) {
+                    let href = anchor.attr('href');
+                    if (href.startsWith('/')) href = 'https://www.psx.com.pk' + href;
+                    links.push(href);
                 }
-            });
-        """)
-        time.sleep(2)
-    except Exception:
+            }
+        } catch(e) {
+            return [];
+        }
+        return links;
+        """
+        
+        result = driver.execute_script(js_code)
+        if result and len(result) > 0:
+            print(f"  [Strategy 1] Successfully extracted {len(result)} links via DataTable API.")
+            return set(result)
+        else:
+            print("  [Strategy 1] DataTable API returned 0 links. Escalating...")
+            return set()
+    except Exception as e:
+        print(f"  [Strategy 1] Failed: {str(e)[:80]}. Escalating...")
+        return set()
+
+
+def _strategy_2_selenium_explicit_wait(driver: webdriver.Chrome) -> set:
+    """
+    STRATEGY 2: Wait for the table to render, then use Selenium XPath.
+    This waits for the AJAX to finish populating <tbody> with rows.
+    """
+    print("  [Strategy 2] Waiting for table rows via Selenium explicit wait...")
+    try:
+        # Wait for at least 2 rows to appear in the tbody
+        WebDriverWait(driver, 20).until(
+            EC.presence_of_all_elements_located((By.XPATH, "//table//tbody/tr/td/a[contains(@href, 'listed-companies')]"))
+        )
+        time.sleep(2)  # Extra buffer for lazy-load
+        
+        elements = driver.find_elements(By.XPATH, "//table//tbody/tr/td/a[contains(@href, 'listed-companies')]")
+        
+        links = set()
+        for el in elements:
+            href = el.get_attribute("href")
+            if href:
+                if href.startswith("/"):
+                    href = "https://www.psx.com.pk" + href
+                if "listed-companies" in href:
+                    links.add(href)
+        
+        if links:
+            print(f"  [Strategy 2] Found {len(links)} links via Selenium XPath.")
+            return links
+        else:
+            print("  [Strategy 2] XPath found elements but 0 links extracted. Escalating...")
+            return set()
+    except TimeoutException:
+        print("  [Strategy 2] Timeout waiting for table rows. Escalating...")
+        return set()
+    except Exception as e:
+        print(f"  [Strategy 2] Failed: {str(e)[:80]}. Escalating...")
+        return set()
+
+
+def _strategy_3_full_beautifulsoup_scan(driver: webdriver.Chrome) -> set:
+    """
+    STRATEGY 3: Full-page scan using BeautifulSoup AFTER ensuring JavaScript has run.
+    Also handles pagination by clicking "Next" buttons.
+    """
+    print("  [Strategy 3] Performing full BeautifulSoup scan with pagination...")
+    
+    all_links = set()
+    
+    # Ensure we are on page 1
+    try:
+        # Try to find and click "Show All" if it exists
+        show_all = driver.find_element(By.XPATH, "//*[contains(text(),'Show All')]")
+        show_all.click()
+        time.sleep(3)
+    except:
         pass
-
-    for xpath in [
-        "//button[normalize-space()='Show All']",
-        "//a[normalize-space()='Show All']",
-        "//*[contains(@class,'show-all')]",
-        "//*[contains(text(),'Show All')]",
-    ]:
+    
+    current_page = 1
+    max_pages = 20  # Safety limit to avoid infinite loop
+    
+    while current_page <= max_pages:
         try:
-            btn = WebDriverWait(driver, 3).until(
-                EC.element_to_be_clickable((By.XPATH, xpath))
-            )
-            btn.click()
+            # Wait for body and scroll
+            WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
-        except (TimeoutException, NoSuchElementException):
-            pass
-
-
-def get_all_company_links(driver: webdriver.Chrome) -> list:
-    """
-    PATCHED: Uses Selenium's direct find_elements to extract links
-    instead of relying only on BeautifulSoup.
-    """
-    print(f"\n  Loading listing page: {BASE_URL}")
-
-    for attempt in range(MAX_RETRIES):
-        try:
-            driver.get(BASE_URL)
-            WebDriverWait(driver, 30).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            time.sleep(4)
-
-            _scroll_fully(driver)
-            _try_show_all(driver)
-            _scroll_fully(driver)
-
-            # ---------- PATCH: WAIT FOR TABLE ROWS ----------
-            try:
-                WebDriverWait(driver, 20).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr"))
-                )
-                print("  Table rows detected.")
-            except TimeoutException:
-                print("  Warning: Table rows not detected, but continuing...")
-
-            # ---------- METHOD 1: SELENIUM DIRECT XPATH ----------
-            print("  Extracting links using Selenium XPath...")
-            link_elements = driver.find_elements(
-                By.XPATH,
-                "//a[contains(@href, '/listed-companies/') or contains(@href, '/psx/resources-and-tools/listings/listed-companies/')]"
-            )
             
-            selenium_links = set()
-            for el in link_elements:
-                href = el.get_attribute("href")
-                if href and "listed-companies" in href:
-                    # Clean up the URL
-                    if href.startswith("/"):
-                        href = "https://www.psx.com.pk" + href
-                    # Skip the listing page itself
-                    if href.rstrip("/") not in [BASE_URL, BASE_URL + "/"]:
-                        selenium_links.add(href)
-
-            if selenium_links:
-                print(f"  Selenium found {len(selenium_links)} company links.")
-                return list(selenium_links)
-
-            # ---------- METHOD 2: BEAUTIFULSOUP FALLBACK ----------
-            print("  Selenium found 0 links. Falling back to BeautifulSoup...")
             soup = BeautifulSoup(driver.page_source, "lxml")
             
-            links = set()
+            # Find all links containing 'listed-companies' but skip the listing page itself
             for a in soup.find_all("a", href=True):
                 href = a["href"].strip()
                 if not href or href.startswith("#") or "javascript" in href:
                     continue
-                if "listed-companies" in href:
+                if "listed-companies" in href and "resources-and-tools" in href:
                     full = f"https://www.psx.com.pk{href}" if href.startswith("/") else href
                     if full.rstrip("/") not in [BASE_URL, BASE_URL + "/"]:
-                        links.add(full)
+                        all_links.add(full)
+            
+            print(f"  [Strategy 3] Page {current_page}: Found {len(all_links)} links so far.")
+            
+            # Try to click the "Next" pagination button
+            try:
+                next_btn = driver.find_element(By.XPATH, "//a[contains(@class,'next') or contains(text(),'Next')]")
+                if "disabled" in (next_btn.get_attribute("class") or ""):
+                    break
+                next_btn.click()
+                time.sleep(3)
+                current_page += 1
+            except NoSuchElementException:
+                break
+            except StaleElementReferenceException:
+                break
+                
+        except Exception as e:
+            print(f"  [Strategy 3] Error on page {current_page}: {str(e)[:80]}")
+            break
+    
+    if all_links:
+        print(f"  [Strategy 3] Total unique links found: {len(all_links)}")
+    else:
+        print("  [Strategy 3] No links found. PSX structure might have changed drastically.")
+    
+    return all_links
 
+
+def get_all_company_links(driver: webdriver.Chrome) -> list:
+    """
+    Main orchestrator for the 3 escalating strategies.
+    Returns a list of unique company detail page URLs.
+    """
+    print(f"\n  Loading listing page: {BASE_URL}")
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            # Navigate to the page
+            driver.get(BASE_URL)
+            WebDriverWait(driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(4)  # Initial JS warm-up
+            
+            # -----------------------------------------------------------------
+            # STRATEGY 1: Direct DataTable API
+            # -----------------------------------------------------------------
+            links = _strategy_1_direct_datatable_api(driver)
             if links:
-                print(f"  BeautifulSoup found {len(links)} company links.")
                 return list(links)
-
-            # ---------- METHOD 3: ROW-BY-ROW SCAN ----------
-            print("  No links found. Trying row-by-row scan...")
-            for row in soup.find_all("tr"):
-                for a in row.find_all("a", href=True):
-                    href = a["href"].strip()
-                    if "listed-companies" in href:
-                        full = f"https://www.psx.com.pk{href}" if href.startswith("/") else href
-                        if full.rstrip("/") not in [BASE_URL, BASE_URL + "/"]:
-                            links.add(full)
-
+            
+            # -----------------------------------------------------------------
+            # STRATEGY 2: Selenium Explicit Wait + XPath
+            # -----------------------------------------------------------------
+            links = _strategy_2_selenium_explicit_wait(driver)
             if links:
-                print(f"  Row-by-row found {len(links)} company links.")
                 return list(links)
-
-            # ---------- PAGINATION FALLBACK ----------
-            print("  Checking for pagination links...")
-            for page_link in driver.find_elements(By.XPATH, "//a[contains(@href, 'page=')]"):
-                try:
-                    page_link.click()
-                    time.sleep(3)
-                    soup = BeautifulSoup(driver.page_source, "lxml")
-                    new_links = {a["href"] for a in soup.find_all("a", href=True) if "listed-companies" in a["href"]}
-                    links.update(new_links)
-                except Exception:
-                    continue
-
+            
+            # -----------------------------------------------------------------
+            # STRATEGY 3: Full BeautifulSoup Scan with Pagination
+            # -----------------------------------------------------------------
+            links = _strategy_3_full_beautifulsoup_scan(driver)
             if links:
-                print(f"  Pagination found {len(links)} company links.")
                 return list(links)
-
-            print("  No links found in any method.")
-            return []
-
+            
+            # If all strategies fail, retry the whole process
+            print(f"  All strategies failed on attempt {attempt+1}. Retrying...")
+            
         except Exception as e:
             wait = 5 * (attempt + 1)
             print(f"  Attempt {attempt+1} failed: {str(e)[:80]}  — retrying in {wait}s …")
             time.sleep(wait)
-
-    print("  ERROR: Could not retrieve company links after all retries.")
+    
+    print("  FATAL: All 3 strategies failed after max retries.")
     return []
 
 
@@ -390,7 +438,7 @@ def scrape_company(driver: webdriver.Chrome, url: str) -> str:
 # ──────────────────────────────────────────
 def main():
     print("=" * 64)
-    print("  PSX Auditor Scraper — GitHub Actions Edition (PATCHED)")
+    print("  PSX Auditor Scraper — V3 (Escalating Strategies)")
     print(f"  Target auditor : {TARGET_AUDITOR}")
     print(f"  Listing URL    : {BASE_URL}")
     print("=" * 64)
@@ -404,7 +452,7 @@ def main():
     try:
         all_links = get_all_company_links(driver)
         if not all_links:
-            print("\nFATAL: No company links found. Exiting.")
+            print("\nFATAL: No company links found after all strategies. Exiting.")
             sys.exit(1)
 
         remaining = [u for u in all_links if u not in processed_urls]
