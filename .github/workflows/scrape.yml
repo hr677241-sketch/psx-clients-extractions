@@ -1,0 +1,80 @@
+name: PSX Auditor Scraper
+
+on:
+  workflow_dispatch:          # Manual trigger from the Actions tab
+  schedule:
+    - cron: '0 2 * * 1'      # Auto-run every Monday at 2:00 AM UTC
+
+jobs:
+  scrape-psx:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90       # Kill the job if it hangs past 90 min
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ──────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'             # Cache pip packages for faster re-runs
+
+      # ── 3. Chrome install (modern, no deprecated apt-key) ────────
+      - name: Install Google Chrome
+        run: |
+          echo "Installing Chrome..."
+          wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y ./google-chrome-stable_current_amd64.deb
+          google-chrome --version
+
+      # ── 4. Python dependencies ───────────────────────────────────
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip --quiet
+          pip install -r requirements.txt --quiet
+
+      # ── 5. Restore prior checkpoint so we can resume if needed ───
+      - name: Restore scraper checkpoint
+        uses: actions/cache@v4
+        with:
+          path: scraper_checkpoint.json
+          key: psx-scraper-checkpoint-${{ github.run_id }}
+          restore-keys: |
+            psx-scraper-checkpoint-
+
+      # ── 6. Run the scraper ───────────────────────────────────────
+      - name: Run PSX Auditor Scraper
+        run: python scraper.py
+
+      # ── 7. Upload full results (runs even if script partially fails)
+      - name: Upload full company + auditor data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psx-all-companies-run${{ github.run_number }}
+          path: psx_companies_auditor_list.xlsx
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ── 8. Upload filtered results ───────────────────────────────
+      - name: Upload filtered results (Reanda Haroon Zakaria)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psx-filtered-results-run${{ github.run_number }}
+          path: filtered_psx_companies_auditor_list.xlsx
+          if-no-files-found: warn
+          retention-days: 90       # Keep filtered file longer
+
+      # ── 9. Upload checkpoint on failure (for debugging) ──────────
+      - name: Upload checkpoint on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psx-checkpoint-run${{ github.run_number }}
+          path: scraper_checkpoint.json
+          if-no-files-found: ignore
